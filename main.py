@@ -11,8 +11,10 @@ import operator
 import platform
 import queue
 import re
+import ssl
 import threading
 import tkinter as tk
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from tkinter import messagebox
@@ -20,15 +22,71 @@ from urllib.error import URLError
 from urllib.parse import quote, urljoin, urlsplit
 from urllib.request import Request, urlopen
 from uuid import uuid4
+import webbrowser
 
 
 BG = "#10131c"
 PANEL = "#191e2b"
-PANEL_LIGHT = "#232a3b"
+PANEL_LIGHT = "#2d498e"
 ACCENT = "#8b7bff"
 TEXT = "#f4f3ff"
 MUTED = "#c5cbda"
 GREEN = "#6ee7b7"
+STARTPAGE_URL = "https://www.startpage.com/"
+
+
+@dataclass
+class BrowserTab:
+    frame: tk.Frame
+    address: tk.Entry
+    page: tk.Text
+    page_title: tk.Label
+    status: tk.Label
+    tab_button: tk.Label
+    external_button: tk.Label
+    back_button: tk.Label
+    forward_button: tk.Label
+    history: list[str] = field(default_factory=list)
+    history_index: int = -1
+    request_id: int = 0
+
+
+def _create_browser_ssl_context() -> ssl.SSLContext:
+    context = ssl.create_default_context()
+    verify_paths = ssl.get_default_verify_paths()
+    if (
+        platform.system() == "Darwin"
+        and not verify_paths.cafile
+        and not verify_paths.capath
+    ):
+        system_ca_bundle = Path("/etc/ssl/cert.pem")
+        if system_ca_bundle.is_file():
+            context.load_verify_locations(cafile=str(system_ca_bundle))
+    return context
+
+
+def _normalize_browser_address(value: str) -> str:
+    value = value.strip()
+    if not value:
+        raise ValueError("Type a website address or a search phrase.")
+    is_local_host = value == "localhost" or value.startswith(
+        ("localhost:", "127.0.0.1", "[::1]")
+    )
+    if "://" not in value and (
+        any(character.isspace() for character in value)
+        or ("." not in value and not is_local_host)
+    ):
+        return STARTPAGE_URL + "sp/search?query=" + quote(value, safe="")
+    if "://" not in value:
+        value = "https://" + value
+    parsed = urlsplit(value)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        raise ValueError("Only valid HTTP and HTTPS web addresses are supported.")
+    return value
+
+
+def _open_in_system_browser(url: str) -> bool:
+    return webbrowser.open_new_tab(url)
 
 
 class PageTextParser(HTMLParser):
@@ -366,88 +424,68 @@ class ArtifacialOS:
         if body is None:
             return
 
-        history: list[str] = []
-        history_index = -1
-        request_id = 0
-        results: queue.Queue[tuple[int, str, object]] = queue.Queue()
+        results: queue.Queue[tuple[BrowserTab, int, str, object]] = queue.Queue()
+        ssl_context = _create_browser_ssl_context()
+        tabs: list[BrowserTab] = []
+        active_tab: BrowserTab | None = None
 
-        toolbar = tk.Frame(body, bg=PANEL)
-        toolbar.pack(fill="x", padx=12, pady=12)
-        navigation = tk.Frame(toolbar, bg=PANEL)
-        navigation.pack(fill="x", padx=8, pady=8)
-        address = tk.Entry(
-            navigation, bg="#10131c", fg=TEXT, insertbackground=TEXT,
-            relief="flat", font=("Arial", 12),
-        )
-        address.pack(side="left", fill="x", expand=True, padx=8, ipady=9)
-        self._button(navigation, "Go", lambda: navigate(address.get())).pack(
-            side="right", padx=(4, 8)
-        )
+        tab_bar = tk.Frame(body, bg=PANEL)
+        tab_bar.pack(fill="x", padx=12, pady=(12, 0))
+        add_tab_button = self._button(tab_bar, "+", lambda: create_tab())
+        add_tab_button.pack(side="right", padx=4, pady=4)
+        content = tk.Frame(body, bg=BG)
+        content.pack(fill="both", expand=True, padx=12, pady=8)
 
-        controls = tk.Frame(toolbar, bg=PANEL)
-        controls.pack(fill="x", padx=8, pady=(0, 8))
-        page_title = self._label(controls, "Ready to browse", fg=MUTED)
-        page_title.pack(side="left", padx=8)
-        status = self._label(controls, "Enter a website address or search term.", fg=MUTED)
-        status.pack(side="right", padx=8)
-
-        reader_frame = tk.Frame(body, bg=BG)
-        reader_frame.pack(fill="both", expand=True, padx=12, pady=(0, 12))
-        scrollbar = tk.Scrollbar(reader_frame)
-        scrollbar.pack(side="right", fill="y")
-        page = tk.Text(
-            reader_frame, bg="#faf9f6", fg="#20212a",
-            insertbackground="#20212a", relief="flat", wrap="word",
-            padx=30, pady=24, font=("Arial", 14),
-            yscrollcommand=scrollbar.set, cursor="arrow",
-        )
-        page.pack(side="left", fill="both", expand=True)
-        scrollbar.configure(command=page.yview)
-        page.tag_configure("page_title", font=("Arial", 24, "bold"), spacing3=18)
-        page.insert(
-            "1.0",
-            "Artifacial Browser\n\n",
-            "page_title",
-        )
-        page.insert(
-            "end",
-            "A simple, text-focused browser. Type a website address above, "
-            "or enter a phrase to search the web. JavaScript-heavy sites may "
-            "not display as they do in a full browser.\n\n"
-            "Your pages are fetched over HTTPS when possible.",
-        )
-        page.bind("<Key>", lambda _event: "break")
-
-        def set_address(value: str) -> None:
-            address.delete(0, "end")
-            address.insert(0, value)
-
-        def normalize_address(value: str) -> str:
-            value = value.strip()
-            if not value:
-                raise ValueError("Type a website address or a search phrase.")
-            if any(character.isspace() for character in value):
-                return "https://duckduckgo.com/?q=" + quote(value)
-            if "://" not in value:
-                value = "https://" + value
-            parsed = urlsplit(value)
-            if parsed.scheme not in ("http", "https") or not parsed.hostname:
-                raise ValueError("Only valid HTTP and HTTPS web addresses are supported.")
-            return value
-
-        def set_history_buttons() -> None:
-            back_button.configure(fg=TEXT if history_index > 0 else MUTED)
-            forward_button.configure(
-                fg=TEXT if history_index + 1 < len(history) else MUTED
+        def update_history_buttons(tab: BrowserTab) -> None:
+            tab.back_button.configure(fg=TEXT if tab.history_index > 0 else MUTED)
+            tab.forward_button.configure(
+                fg=TEXT if tab.history_index + 1 < len(tab.history) else MUTED
             )
 
-        def fetch_page(url: str, current_request: int, mode: str) -> None:
+        def open_in_system_browser(tab: BrowserTab, url: str) -> None:
+            try:
+                opened = _open_in_system_browser(url)
+            except OSError as error:
+                tab.status.configure(
+                    text=f"Could not open system browser: {error}", fg="#ff8585"
+                )
+                return
+            tab.status.configure(
+                text=(
+                    "Opened in your default browser"
+                    if opened else "Could not open system browser"
+                ),
+                fg=GREEN if opened else "#ff8585",
+            )
+
+        def select_tab(tab: BrowserTab) -> None:
+            nonlocal active_tab
+            if active_tab is tab:
+                return
+            if active_tab is not None and active_tab in tabs:
+                active_tab.frame.pack_forget()
+                active_tab.tab_button.configure(bg=PANEL, fg=MUTED)
+            active_tab = tab
+            tab.frame.pack(fill="both", expand=True)
+            tab.tab_button.configure(bg=PANEL_LIGHT, fg=TEXT)
+            update_history_buttons(tab)
+
+        def fetch_page(
+            tab: BrowserTab, url: str, current_request: int, mode: str
+        ) -> None:
             try:
                 request = Request(
                     url,
-                    headers={"User-Agent": "ArtifacialOS/1.0 (Python text browser)"},
+                    headers={
+                        "User-Agent": (
+                            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                            "AppleWebKit/537.36 (KHTML, like Gecko) "
+                            "Chrome/131.0.0.0 Safari/537.36"
+                        ),
+                        "Accept": "text/html,application/xhtml+xml",
+                    },
                 )
-                with urlopen(request, timeout=12) as response:
+                with urlopen(request, timeout=12, context=ssl_context) as response:
                     content_type = response.headers.get_content_type()
                     charset = response.headers.get_content_charset() or "utf-8"
                     content = response.read(2_000_001)
@@ -467,127 +505,236 @@ class ArtifacialOS:
                     links = []
                 else:
                     raise ValueError(f"This browser cannot display {content_type} files.")
-                results.put((current_request, "page", (mode, final_url, title, text, links)))
+                results.put(
+                    (tab, current_request, "page", (mode, final_url, title, text, links))
+                )
             except (
                 OSError, URLError, TimeoutError, UnicodeError, ValueError,
                 LookupError, http.client.HTTPException,
             ) as error:
-                results.put((current_request, "error", str(error)))
+                results.put((tab, current_request, "error", str(error)))
 
-        def navigate(value: str, mode: str = "new") -> None:
-            nonlocal request_id
+        def navigate(tab: BrowserTab, value: str, mode: str = "new") -> None:
             try:
-                url = normalize_address(value)
+                url = _normalize_browser_address(value)
             except ValueError as error:
-                status.configure(text=str(error), fg="#ff8585")
+                tab.status.configure(text=str(error), fg="#ff8585")
                 return
-            request_id += 1
-            current_request = request_id
-            set_address(url)
-            status.configure(text="Loading…", fg=MUTED)
+            tab.request_id += 1
+            current_request = tab.request_id
+            tab.address.delete(0, "end")
+            tab.address.insert(0, url)
+            tab.status.configure(text="Loading…", fg=MUTED)
+            tab.external_button.pack_forget()
             threading.Thread(
                 target=fetch_page,
-                args=(url, current_request, mode),
+                args=(tab, url, current_request, mode),
                 daemon=True,
             ).start()
 
-        def go_back() -> None:
-            if history_index > 0:
-                navigate(history[history_index - 1], "back")
-
-        def go_forward() -> None:
-            if history_index + 1 < len(history):
-                navigate(history[history_index + 1], "forward")
-
-        def refresh() -> None:
-            if history_index >= 0:
-                navigate(history[history_index], "refresh")
-            elif address.get().strip():
-                navigate(address.get(), "new")
-
-        back_button = self._styled_button(
-            navigation, "←", go_back, bg=PANEL, fg=MUTED, hover_bg=PANEL_LIGHT,
-            font=("Arial", 16, "bold"), width=3,
-        )
-        back_button.pack(side="left", padx=(4, 0))
-        forward_button = self._styled_button(
-            navigation, "→", go_forward, bg=PANEL, fg=MUTED, hover_bg=PANEL_LIGHT,
-            font=("Arial", 16, "bold"), width=3,
-        )
-        forward_button.pack(side="left")
-        self._styled_button(
-            navigation, "↻", refresh, bg=PANEL, fg=TEXT, hover_bg=PANEL_LIGHT,
-            font=("Arial", 16), width=3,
-        ).pack(side="left")
-        address.pack_forget()
-        address.pack(side="left", fill="x", expand=True, padx=8, ipady=9)
-        set_history_buttons()
-
         def render_page(
-            url: str, title: str, text: str, links: list[tuple[str, str]]
+            tab: BrowserTab, url: str, title: str, text: str,
+            links: list[tuple[str, str]],
         ) -> None:
-            page.configure(state="normal")
-            page.delete("1.0", "end")
-            page.insert("end", title or url, "page_title")
-            page.insert("end", "\n\n")
-            page.insert("end", text)
+            tab.page.configure(state="normal")
+            tab.page.delete("1.0", "end")
+            tab.page.insert("end", title or url, "page_title")
+            tab.page.insert("end", "\n\n")
+            tab.page.insert("end", text)
             search_from = "3.0"
             for index, (label, href) in enumerate(links):
                 if not label.strip():
                     continue
-                start = page.search(label, search_from, stopindex="end")
+                start = tab.page.search(label, search_from, stopindex="end")
                 if not start:
                     continue
                 end = f"{start}+{len(label)}c"
                 tag = f"link_{index}"
-                page.tag_add(tag, start, end)
-                page.tag_configure(tag, foreground="#3459bd", underline=True)
-                page.tag_bind(
+                tab.page.tag_add(tag, start, end)
+                tab.page.tag_configure(tag, foreground="#3459bd", underline=True)
+                tab.page.tag_bind(
                     tag, "<Button-1>",
-                    lambda event, target=urljoin(url, href): navigate(target),
+                    lambda _event, target=urljoin(url, href), current_tab=tab:
+                        navigate(current_tab, target),
                 )
-                page.tag_bind(
+                tab.page.tag_bind(
                     tag, "<Enter>",
-                    lambda _event: page.configure(cursor="hand2"),
+                    lambda _event, current_page=tab.page:
+                        current_page.configure(cursor="hand2"),
                 )
-                page.tag_bind(
+                tab.page.tag_bind(
                     tag, "<Leave>",
-                    lambda _event: page.configure(cursor="arrow"),
+                    lambda _event, current_page=tab.page:
+                        current_page.configure(cursor="arrow"),
                 )
                 search_from = end
-            page.yview_moveto(0)
-            page_title.configure(text=title or url, fg=TEXT)
+            tab.page.yview_moveto(0)
+            tab.page_title.configure(text=title or url, fg=TEXT)
+            tab.tab_button.configure(text=(title or "New Tab")[:24])
+            if (
+                urlsplit(url).hostname in ("www.startpage.com", "startpage.com")
+                and (
+                    title.lower().startswith("access denied")
+                    or "could not load its javascript" in text.lower()
+                    or "verifying your request" in text.lower()
+                )
+            ):
+                tab.page.insert(
+                    "end",
+                    "\n\nStartpage blocked this text-only browser. "
+                    "Open the page in your system browser to continue.",
+                )
+                tab.external_button.pack(side="right", padx=8)
 
         def poll_results() -> None:
-            nonlocal history_index
             if not body.winfo_exists():
                 return
             while True:
                 try:
-                    result_id, result_type, data = results.get_nowait()
+                    tab, result_id, result_type, data = results.get_nowait()
                 except queue.Empty:
                     break
-                if result_id != request_id:
+                if tab not in tabs or result_id != tab.request_id:
                     continue
                 if result_type == "error":
-                    status.configure(text=f"Could not load page: {data}", fg="#ff8585")
+                    tab.status.configure(text=f"Could not load page: {data}", fg="#ff8585")
+                    if urlsplit(tab.address.get()).hostname == "www.startpage.com":
+                        tab.external_button.pack(side="right", padx=8)
                     continue
                 mode, url, title, text, links = data
                 if mode == "new":
-                    del history[history_index + 1:]
-                    history.append(url)
-                    history_index = len(history) - 1
+                    del tab.history[tab.history_index + 1:]
+                    tab.history.append(url)
+                    tab.history_index = len(tab.history) - 1
                 elif mode == "back":
-                    history_index = max(0, history_index - 1)
+                    tab.history_index = max(0, tab.history_index - 1)
                 elif mode == "forward":
-                    history_index = min(len(history) - 1, history_index + 1)
-                set_address(url)
-                render_page(url, title, text, links)
-                status.configure(text=url, fg=MUTED)
-                set_history_buttons()
+                    tab.history_index = min(len(tab.history) - 1, tab.history_index + 1)
+                tab.address.delete(0, "end")
+                tab.address.insert(0, url)
+                render_page(tab, url, title, text, links)
+                tab.status.configure(text=url, fg=MUTED)
+                update_history_buttons(tab)
             body.after(100, poll_results)
 
-        address.bind("<Return>", lambda _event: navigate(address.get()))
+        def create_tab(url: str = STARTPAGE_URL) -> None:
+            tab_frame = tk.Frame(content, bg=BG)
+            tab_header = tk.Frame(tab_bar, bg=PANEL)
+            tab_header.pack(side="left", padx=3, pady=4)
+            tab_button = self._styled_button(
+                tab_header, "New Tab", lambda: None, bg=PANEL, fg=MUTED,
+                hover_bg=PANEL_LIGHT, padx=10, pady=6,
+            )
+            tab_button.pack(side="left")
+            close_button = self._styled_button(
+                tab_header, "×", lambda: None, bg=PANEL, fg=MUTED,
+                hover_bg="#4a3042", width=2, padx=4, pady=6,
+            )
+            close_button.pack(side="left")
+
+            toolbar = tk.Frame(tab_frame, bg=PANEL)
+            toolbar.pack(fill="x", pady=(0, 8))
+            navigation = tk.Frame(toolbar, bg=PANEL)
+            navigation.pack(fill="x", padx=8, pady=8)
+            back_button = self._styled_button(
+                navigation, "←", lambda: None, bg=PANEL, fg=MUTED,
+                hover_bg=PANEL_LIGHT, font=("Arial", 16, "bold"), width=3,
+            )
+            back_button.pack(side="left", padx=(4, 0))
+            forward_button = self._styled_button(
+                navigation, "→", lambda: None, bg=PANEL, fg=MUTED,
+                hover_bg=PANEL_LIGHT, font=("Arial", 16, "bold"), width=3,
+            )
+            forward_button.pack(side="left")
+            refresh_button = self._styled_button(
+                navigation, "↻", lambda: None, bg=PANEL, fg=TEXT,
+                hover_bg=PANEL_LIGHT, font=("Arial", 16), width=3,
+            )
+            refresh_button.pack(side="left")
+            go_button = self._button(navigation, "Go", lambda: None)
+            go_button.pack(side="right", padx=(4, 8))
+            address = tk.Entry(
+                navigation, bg="#10131c", fg=TEXT, insertbackground=TEXT,
+                relief="flat", font=("Arial", 12),
+            )
+            address.pack(side="left", fill="x", expand=True, padx=8, ipady=9)
+
+            controls = tk.Frame(toolbar, bg=PANEL)
+            controls.pack(fill="x", padx=8, pady=(0, 8))
+            page_title = self._label(controls, "Startpage", fg=MUTED)
+            page_title.pack(side="left", padx=8)
+            status = self._label(controls, "Loading Startpage…", fg=MUTED)
+            status.pack(side="right", padx=8)
+            external_button = self._button(
+                controls, "Open in system browser",
+                lambda: open_in_system_browser(tab, address.get()),
+            )
+
+            reader_frame = tk.Frame(tab_frame, bg=BG)
+            reader_frame.pack(fill="both", expand=True)
+            scrollbar = tk.Scrollbar(reader_frame)
+            scrollbar.pack(side="right", fill="y")
+            page = tk.Text(
+                reader_frame, bg="#faf9f6", fg="#20212a",
+                insertbackground="#20212a", relief="flat", wrap="word",
+                padx=30, pady=24, font=("Arial", 14),
+                yscrollcommand=scrollbar.set, cursor="arrow",
+            )
+            page.pack(side="left", fill="both", expand=True)
+            scrollbar.configure(command=page.yview)
+            page.tag_configure("page_title", font=("Arial", 24, "bold"), spacing3=18)
+            page.insert("1.0", "Loading Startpage…", "page_title")
+            page.bind("<Key>", lambda _event: "break")
+
+            tab = BrowserTab(
+                frame=tab_frame,
+                address=address,
+                page=page,
+                page_title=page_title,
+                status=status,
+                tab_button=tab_button,
+                external_button=external_button,
+                back_button=back_button,
+                forward_button=forward_button,
+            )
+            tabs.append(tab)
+            tab_button.bind("<Button-1>", lambda _event: select_tab(tab))
+            close_button.bind("<Button-1>", lambda _event: close_tab(tab))
+            back_button.bind(
+                "<Button-1>",
+                lambda _event: navigate(tab, tab.history[tab.history_index - 1], "back")
+                if tab.history_index > 0 else None,
+            )
+            forward_button.bind(
+                "<Button-1>",
+                lambda _event: navigate(tab, tab.history[tab.history_index + 1], "forward")
+                if tab.history_index + 1 < len(tab.history) else None,
+            )
+            refresh_button.bind(
+                "<Button-1>",
+                lambda _event: navigate(tab, tab.history[tab.history_index], "refresh")
+                if tab.history_index >= 0 else navigate(tab, tab.address.get()),
+            )
+            go_button.bind("<Button-1>", lambda _event: navigate(tab, address.get()))
+            address.bind("<Return>", lambda _event: navigate(tab, address.get()))
+            select_tab(tab)
+            navigate(tab, url)
+
+        def close_tab(tab: BrowserTab) -> None:
+            if tab not in tabs:
+                return
+            index = tabs.index(tab)
+            tab.request_id += 1
+            tabs.remove(tab)
+            tab.frame.destroy()
+            tab.tab_button.master.destroy()
+            if active_tab is tab:
+                if tabs:
+                    select_tab(tabs[min(index, len(tabs) - 1)])
+                else:
+                    create_tab()
+
+        create_tab()
         poll_results()
 
     def _show_file_location(
@@ -1074,4 +1221,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
- #codins all bout pavcience
