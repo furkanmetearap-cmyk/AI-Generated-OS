@@ -179,7 +179,6 @@ class BrowserWidget(QWidget):
         self._fullscreen_host_was_maximized = False
         self._fullscreen_host_was_fullscreen = False
         self._fullscreen_subwindow_was_maximized = False
-        self._fullscreen_exit_request_view: QWebEngineView | None = None
 
         self.status = QLabel("Ready")
         self.status.setStyleSheet(f"color: {MUTED};")
@@ -337,8 +336,7 @@ class BrowserWidget(QWidget):
         self, view: QWebEngineView, request: QWebEngineFullScreenRequest
     ) -> None:
         if not request.toggleOn():
-            if self._fullscreen_exit_request_view is view:
-                self._fullscreen_exit_request_view = None
+            if view is self._fullscreen_view:
                 request.accept()
             else:
                 request.reject()
@@ -414,14 +412,6 @@ class BrowserWidget(QWidget):
         if subwindow is None or host is None or view is None:
             return
 
-        exit_fullscreen_action = view.page().action(
-            QWebEnginePage.WebAction.ExitFullScreen
-        )
-        if exit_fullscreen_action.isEnabled():
-            self._fullscreen_exit_request_view = view
-            view.triggerPageAction(QWebEnginePage.WebAction.ExitFullScreen)
-            QTimer.singleShot(1000, lambda: self._clear_fullscreen_exit_request(view))
-
         self._fullscreen_view = None
         self._fullscreen_subwindow = None
         self._fullscreen_host = None
@@ -436,10 +426,6 @@ class BrowserWidget(QWidget):
             host.showMaximized()
         else:
             host.showNormal()
-
-    def _clear_fullscreen_exit_request(self, view: QWebEngineView) -> None:
-        if self._fullscreen_exit_request_view is view:
-            self._fullscreen_exit_request_view = None
 
     def close_tab(self, index: int) -> None:
         view = self.tabs.widget(index)
