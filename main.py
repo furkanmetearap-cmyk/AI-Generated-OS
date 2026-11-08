@@ -1,28 +1,41 @@
-"""ArtifacialOS: a tiny desktop operating-system simulator made with Tkinter."""
+"""ArtifacialOS: a tiny desktop simulator with an embedded web browser."""
 
 from __future__ import annotations
 
 import ast
 from collections.abc import Callable
-from html.parser import HTMLParser
-import http.client
 import json
 import operator
 import platform
-import queue
-import re
-import ssl
-import threading
-import tkinter as tk
-from dataclasses import dataclass, field
+import sys
 from datetime import datetime
 from pathlib import Path
-from tkinter import messagebox
-from urllib.error import URLError
-from urllib.parse import quote, urljoin, urlsplit
-from urllib.request import Request, urlopen
+from urllib.parse import quote, urlsplit
 from uuid import uuid4
-import webbrowser
+
+from PySide6.QtCore import QEvent, QRectF, QSize, Qt, QTimer, QUrl
+from PySide6.QtGui import QCloseEvent, QKeySequence, QPainter, QShortcut
+from PySide6.QtWebEngineCore import QWebEnginePage
+from PySide6.QtWebEngineWidgets import QWebEngineView
+from PySide6.QtWidgets import (
+    QApplication,
+    QGridLayout,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QListWidget,
+    QMainWindow,
+    QMdiArea,
+    QMdiSubWindow,
+    QMessageBox,
+    QPushButton,
+    QPlainTextEdit,
+    QSplitter,
+    QTabWidget,
+    QTextEdit,
+    QVBoxLayout,
+    QWidget,
+)
 
 
 BG = "#10131c"
@@ -33,36 +46,6 @@ TEXT = "#f4f3ff"
 MUTED = "#c5cbda"
 GREEN = "#6ee7b7"
 STARTPAGE_URL = "https://www.startpage.com/"
-
-
-@dataclass
-class BrowserTab:
-    frame: tk.Frame
-    address: tk.Entry
-    page: tk.Text
-    page_title: tk.Label
-    status: tk.Label
-    tab_button: tk.Label
-    external_button: tk.Label
-    back_button: tk.Label
-    forward_button: tk.Label
-    history: list[str] = field(default_factory=list)
-    history_index: int = -1
-    request_id: int = 0
-
-
-def _create_browser_ssl_context() -> ssl.SSLContext:
-    context = ssl.create_default_context()
-    verify_paths = ssl.get_default_verify_paths()
-    if (
-        platform.system() == "Darwin"
-        and not verify_paths.cafile
-        and not verify_paths.capath
-    ):
-        system_ca_bundle = Path("/etc/ssl/cert.pem")
-        if system_ca_bundle.is_file():
-            context.load_verify_locations(cafile=str(system_ca_bundle))
-    return context
 
 
 def _normalize_browser_address(value: str) -> str:
@@ -85,151 +68,235 @@ def _normalize_browser_address(value: str) -> str:
     return value
 
 
-def _open_in_system_browser(url: str) -> bool:
-    return webbrowser.open_new_tab(url)
+def _stylesheet() -> str:
+    return f"""
+        QWidget {{ background: {BG}; color: {TEXT}; font: 12pt Arial; }}
+        QMainWindow {{ background: {BG}; }}
+        QLabel#desktopTitle {{ background: transparent; font-size: 13pt; font-weight: bold; }}
+        QWidget#dock {{ background: #171b27; }}
+        QPushButton {{
+            background: #222838; color: {TEXT}; border: 0; border-radius: 8px;
+            padding: 8px 12px;
+        }}
+        QPushButton:hover {{ background: #303950; }}
+        QPushButton#launcherButton {{ background: {ACCENT}; font-size: 16pt; font-weight: bold; }}
+        QLineEdit, QPlainTextEdit, QTextEdit, QListWidget {{
+            background: {PANEL}; color: {TEXT}; border: 1px solid #303747;
+            border-radius: 5px; padding: 7px; selection-background-color: {ACCENT};
+        }}
+        QTabWidget::pane {{ border: 1px solid #303747; }}
+        QTabBar::tab {{ background: {PANEL}; padding: 7px 12px; }}
+        QTabBar::tab:selected {{ background: #303950; }}
+        QToolBar {{ background: {PANEL}; border: 0; spacing: 5px; padding: 4px; }}
+        QToolButton {{ color: {TEXT}; padding: 6px; }}
+        QStatusBar {{ background: {PANEL}; color: {MUTED}; }}
+        QMdiArea {{ border: 0; }}
+        QMdiSubWindow {{ background: {BG}; }}
+        QScrollArea {{ border: 0; }}
+    """
 
 
-class PageTextParser(HTMLParser):
-    """Extract safe-to-display text and links without executing page content."""
+class BrowserTab(QWebEngineView):
+    def __init__(self, create_tab: Callable[[], QWebEngineView]) -> None:
+        super().__init__()
+        self.create_tab = create_tab
 
-    BLOCK_TAGS = {
-        "address", "article", "blockquote", "br", "dd", "div", "dl", "dt",
-        "fieldset", "figcaption", "figure", "footer", "form", "h1", "h2",
-        "h3", "h4", "h5", "h6", "header", "hr", "li", "main", "nav",
-        "ol", "p", "pre", "section", "table", "td", "th", "tr", "ul",
-    }
+    def createWindow(
+        self, window_type: QWebEnginePage.WebWindowType
+    ) -> QWebEngineView:
+        return self.create_tab()
+
+
+class BrowserWidget(QWidget):
+    """Tabbed Qt WebEngine browser hosted inside an ArtifacialOS app window."""
 
     def __init__(self) -> None:
-        super().__init__(convert_charrefs=True)
-        self.title_parts: list[str] = []
-        self.parts: list[tuple[str, str | None]] = []
-        self.hidden_depth = 0
-        self.in_title = False
-        self.in_head = False
+        super().__init__()
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(7)
 
-    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        attributes = dict(attrs)
-        if tag in {"script", "style", "noscript", "svg"}:
-            self.hidden_depth += 1
-            return
-        if self.hidden_depth:
-            return
-        if tag == "title":
-            self.in_title = True
-        if tag == "head":
-            self.in_head = True
-        if self.in_head and tag != "title":
-            return
-        if tag in self.BLOCK_TAGS:
-            self._append("\n\n")
-        if tag == "a" and attributes.get("href"):
-            href = attributes["href"]
-            if href is not None:
-                self.parts.append(("", href))
+        navigation = QHBoxLayout()
+        for label, callback in (
+            ("Back", lambda: self.current_view().back()),
+            ("Forward", lambda: self.current_view().forward()),
+            ("Reload", lambda: self.current_view().reload()),
+        ):
+            button = QPushButton(label)
+            button.clicked.connect(callback)
+            navigation.addWidget(button)
 
-    def handle_endtag(self, tag: str) -> None:
-        if tag in {"script", "style", "noscript", "svg"}:
-            self.hidden_depth = max(0, self.hidden_depth - 1)
+        self.address = QLineEdit()
+        self.address.setPlaceholderText("Enter a website or search")
+        self.address.returnPressed.connect(self.navigate)
+        navigation.addWidget(self.address, 1)
+        new_tab = QPushButton("New Tab")
+        new_tab.clicked.connect(self.add_tab)
+        navigation.addWidget(new_tab)
+        layout.addLayout(navigation)
+
+        self.tabs = QTabWidget()
+        self.tabs.setTabsClosable(True)
+        self.tabs.setMovable(True)
+        self.tabs.currentChanged.connect(self.update_address)
+        self.tabs.tabCloseRequested.connect(self.close_tab)
+        layout.addWidget(self.tabs, 1)
+
+        self.status = QLabel("Ready")
+        self.status.setStyleSheet(f"color: {MUTED};")
+        layout.addWidget(self.status)
+
+        QShortcut(QKeySequence("Ctrl+L"), self, self.focus_address)
+        QShortcut(QKeySequence("Ctrl+T"), self, self.add_tab)
+        QShortcut(QKeySequence("Ctrl+W"), self, self.close_current_tab)
+        self.add_tab()
+
+    def current_view(self) -> QWebEngineView:
+        view = self.tabs.currentWidget()
+        if not isinstance(view, QWebEngineView):
+            raise RuntimeError("The active browser tab is unavailable.")
+        return view
+
+    def focus_address(self) -> None:
+        self.address.setFocus()
+        self.address.selectAll()
+
+    def add_tab(self, *, load_start_page: bool = True) -> QWebEngineView:
+        view = BrowserTab(lambda: self.add_tab(load_start_page=False))
+        index = self.tabs.addTab(view, "New Tab")
+        self.tabs.setCurrentIndex(index)
+        view.titleChanged.connect(
+            lambda title, current_view=view: self.update_tab_title(current_view, title)
+        )
+        view.urlChanged.connect(
+            lambda url, current_view=view: self.update_view_address(current_view, url)
+        )
+        view.loadStarted.connect(lambda: self.status.setText("Loading…"))
+        view.loadFinished.connect(
+            lambda success: self.status.setText(
+                "Page loaded" if success else "Could not load page"
+            )
+        )
+        if load_start_page:
+            view.setUrl(QUrl(STARTPAGE_URL))
+        return view
+
+    def close_tab(self, index: int) -> None:
+        view = self.tabs.widget(index)
+        self.tabs.removeTab(index)
+        if view is not None:
+            view.deleteLater()
+        if self.tabs.count() == 0:
+            self.add_tab()
+
+    def close_current_tab(self) -> None:
+        index = self.tabs.currentIndex()
+        if index >= 0:
+            self.close_tab(index)
+
+    def navigate(self) -> None:
+        try:
+            url = _normalize_browser_address(self.address.text())
+        except ValueError as error:
+            self.status.setText(str(error))
             return
-        if self.hidden_depth:
+        self.current_view().setUrl(QUrl(url))
+
+    def update_tab_title(self, view: QWebEngineView, title: str) -> None:
+        index = self.tabs.indexOf(view)
+        if index >= 0:
+            self.tabs.setTabText(index, (title or "New Tab")[:24])
+        if view is self.tabs.currentWidget():
+            window = self.window()
+            if isinstance(window, QMdiSubWindow):
+                window.setWindowTitle(f"{title or 'New Tab'} - Browser")
+
+    def update_address(self, index: int) -> None:
+        if index >= 0:
+            self.update_view_address(self.current_view(), self.current_view().url())
+
+    def update_view_address(self, view: QWebEngineView, url: QUrl) -> None:
+        if view is self.tabs.currentWidget():
+            self.address.setText(url.toString())
+
+
+class InternalWindow(QMdiSubWindow):
+    def __init__(self, key: str, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.key = key
+        self.before_close: Callable[[], bool] | None = None
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        self.setMinimumSize(380, 260)
+
+    def closeEvent(self, event: QCloseEvent) -> None:
+        if self.before_close is not None and not self.before_close():
+            event.ignore()
             return
-        if tag == "title":
-            self.in_title = False
-        if tag == "head":
-            self.in_head = False
-        if self.in_head and tag != "title":
-            return
-        if tag in self.BLOCK_TAGS:
-            self._append("\n\n")
-        if tag == "a":
-            self.parts.append(("", None))
-
-    def handle_data(self, data: str) -> None:
-        if self.in_title:
-            self.title_parts.append(data)
-            return
-        if self.hidden_depth or (self.in_head and not self.in_title):
-            return
-        self._append(re.sub(r"\s+", " ", data))
-
-    def _append(self, text: str) -> None:
-        if self.parts:
-            content, href = self.parts[-1]
-            self.parts[-1] = (content + text, href)
-        else:
-            self.parts.append((text, None))
-
-    def result(self) -> tuple[str, str, list[tuple[str, str]]]:
-        title = " ".join(" ".join(self.title_parts).split())
-        text = "".join(content for content, _href in self.parts)
-        text = re.sub(r"[ \t]+", " ", text)
-        text = "\n".join(line.strip() for line in text.splitlines())
-        text = "\n".join(line for line in text.splitlines() if line)
-        links: list[tuple[str, str]] = []
-        active_href: str | None = None
-        active_text = ""
-        for content, href in self.parts:
-            if href is not None:
-                if active_href != href and active_text:
-                    links.append((active_text, active_href or ""))
-                    active_text = ""
-                active_href = href
-                active_text += content
-            elif active_href is not None:
-                links.append((active_text, active_href))
-                active_href = None
-                active_text = ""
-        if active_href is not None:
-            links.append((active_text, active_href))
-        return title, text, links
+        event.accept()
 
 
-class ArtifacialOS:
-    """A self-contained desktop shell with a handful of useful simulated apps."""
+class DesktopArea(QMdiArea):
+    def viewportEvent(self, event: QEvent) -> bool:
+        handled = super().viewportEvent(event)
+        if event.type() == QEvent.Type.Paint:
+            painter = QPainter(self.viewport())
+            painter.fillRect(self.viewport().rect(), BG)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush("#211e47")
+            painter.drawEllipse(QRectF(620, -280, 630, 640))
+            painter.setBrush("#172c3c")
+            painter.drawEllipse(QRectF(-280, 390, 600, 600))
+        return handled
 
-    def __init__(self, root: tk.Tk) -> None:
-        self.root = root
-        self.root.title("ArtifacialOS")
-        self.root.geometry("1100x720")
-        self.root.minsize(760, 520)
-        self.root.configure(bg=BG)
-        self.root.option_add("*Font", ("Arial", 12))
-        self.open_windows: dict[str, tk.Toplevel] = {}
-        self.window_close_handlers: dict[str, Callable[[], None]] = {}
+
+class ArtifacialOS(QMainWindow):
+    """Desktop shell and app windows, all hosted in one Qt application window."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.setWindowTitle("ArtifacialOS")
+        self.resize(1100, 720)
+        self.setMinimumSize(760, 520)
+        self.open_windows: dict[str, InternalWindow] = {}
         self.notes_path = Path.home() / ".artifacialos" / "notes.json"
         self.filesystem: dict[str, str] = {
-            "Welcome.txt": "Welcome to ArtifacialOS!\n\nA little desktop made entirely with Python's standard library.",
-            "Ideas.txt": "Things to build:\n- A tiny game\n- A personal website\n- Something wonderful",
+            "Welcome.txt": (
+                "Welcome to ArtifacialOS!\n\n"
+                "A little desktop made with Python and Qt."
+            ),
+            "Ideas.txt": (
+                "Things to build:\n- A tiny game\n- A personal website\n"
+                "- Something wonderful"
+            ),
         }
-        self.launcher: tk.Toplevel | None = None
+        self.setStyleSheet(_stylesheet())
         self._build_desktop()
-        self._tick_clock()
 
     def _build_desktop(self) -> None:
-        self.desktop = tk.Frame(self.root, bg=BG)
-        self.desktop.pack(fill="both", expand=True)
+        desktop = QWidget()
+        layout = QVBoxLayout(desktop)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
 
-        wallpaper = tk.Canvas(self.desktop, bg=BG, highlightthickness=0)
-        wallpaper.place(relwidth=1, relheight=1)
-        wallpaper.create_oval(620, -280, 1250, 360, fill="#211e47", outline="")
-        wallpaper.create_oval(-280, 390, 320, 990, fill="#172c3c", outline="")
-        wallpaper.create_text(
-            38, 34, anchor="nw", text="ARTIFACIAL", fill="#ffffff",
-            font=("Arial", 12, "bold"),
-        )
+        heading = QLabel("ARTIFACIAL")
+        heading.setObjectName("desktopTitle")
+        heading.setContentsMargins(22, 14, 0, 10)
+        layout.addWidget(heading)
 
-        self._build_dock()
+        self.mdi = DesktopArea()
+        self.mdi.setViewMode(QMdiArea.ViewMode.SubWindowView)
+        self.mdi.setOption(QMdiArea.AreaOption.DontMaximizeSubWindowOnActivation, True)
+        layout.addWidget(self.mdi, 1)
 
-    def _build_dock(self) -> None:
-        dock = tk.Frame(self.desktop, bg="#171b27", height=62)
-        dock.pack(side="bottom", fill="x")
-        dock.pack_propagate(False)
-        left = tk.Frame(dock, bg="#171b27")
-        left.pack(side="left", padx=12, fill="y")
-        self._styled_button(
-            left, "◈", self.toggle_launcher, bg=ACCENT, fg="white",
-            hover_bg="#7868e7", font=("Arial", 17, "bold"), width=3,
-        ).pack(side="left", padx=(0, 8), pady=9)
+        dock = QWidget()
+        dock.setObjectName("dock")
+        dock_layout = QHBoxLayout(dock)
+        dock_layout.setContentsMargins(12, 6, 14, 6)
+        dock_layout.setSpacing(6)
+        launcher = QPushButton("◈")
+        launcher.setObjectName("launcherButton")
+        launcher.clicked.connect(self.toggle_launcher)
+        dock_layout.addWidget(launcher)
         for label, icon, callback in (
             ("Browser", "◎", self.open_browser),
             ("Files", "▣", self.open_files),
@@ -237,550 +304,217 @@ class ArtifacialOS:
             ("Calculator", "＋", self.open_calculator),
             ("Terminal", ">_", self.open_terminal),
         ):
-            button = self._styled_button(
-                left, f"{icon}  {label}", callback, bg="#222838", fg=TEXT,
-                hover_bg="#303950", padx=12,
-            )
-            button.pack(side="left", padx=3, pady=12)
+            button = QPushButton(f"{icon}  {label}")
+            button.clicked.connect(callback)
+            dock_layout.addWidget(button)
+        dock_layout.addStretch(1)
+        settings = QPushButton("⚙")
+        settings.clicked.connect(self.open_settings)
+        dock_layout.addWidget(settings)
+        self.clock_label = QLabel()
+        self.clock_label.setAlignment(Qt.AlignmentFlag.AlignRight)
+        dock_layout.addWidget(self.clock_label)
+        layout.addWidget(dock)
 
-        right = tk.Frame(dock, bg="#171b27")
-        right.pack(side="right", padx=18, fill="y")
-        self.clock_label = tk.Label(
-            right, bg="#171b27", fg=TEXT, font=("Arial", 12),
-            justify="right",
-        )
-        self.clock_label.pack(side="right", pady=10)
-        self._styled_button(
-            right, "⚙", self.open_settings, bg="#171b27", fg=MUTED,
-            hover_bg="#303950", hover_fg=TEXT, font=("Arial", 15),
-        ).pack(side="right", padx=10, pady=8)
+        self.setCentralWidget(desktop)
+        self.clock_timer = QTimer(self)
+        self.clock_timer.timeout.connect(self._tick_clock)
+        self.clock_timer.start(1000)
+        self._tick_clock()
+
+    def closeEvent(self, event: QCloseEvent) -> None:
+        for window in tuple(self.open_windows.values()):
+            if window.before_close is not None and not window.before_close():
+                event.ignore()
+                return
+        event.accept()
 
     def _tick_clock(self) -> None:
-        if self.root.winfo_exists():
-            self.clock_label.configure(text=datetime.now().strftime("%a, %b %d\n%I:%M %p"))
-            self.root.after(1000, self._tick_clock)
+        self.clock_label.setText(datetime.now().strftime("%a, %b %d\n%I:%M %p"))
 
-    def _window(self, key: str, title: str, size: str = "680x460") -> tk.Frame | None:
+    def _window(
+        self, key: str, title: str, size: QSize = QSize(680, 460)
+    ) -> QWidget | None:
         existing = self.open_windows.get(key)
-        if existing is not None and existing.winfo_exists():
-            existing.deiconify()
-            existing.lift()
+        if existing is not None:
+            existing.showNormal()
+            existing.raise_()
+            self.mdi.setActiveSubWindow(existing)
             return None
 
-        window = tk.Toplevel(self.root)
-        window.title(title)
-        window.geometry(size)
-        window.minsize(420, 300)
-        window.configure(bg=BG)
-        window.transient(self.root)
+        window = InternalWindow(key)
+        window.setWindowTitle(title)
+        window.resize(size)
+        body = QWidget()
+        window.setWidget(body)
+        self.mdi.addSubWindow(window)
         self.open_windows[key] = window
-
-        def close_window() -> None:
-            handler = self.window_close_handlers.get(key)
-            if handler is not None:
-                handler()
-            else:
-                window.destroy()
-
-        window.protocol("WM_DELETE_WINDOW", close_window)
-        window.bind("<Destroy>", lambda event, k=key: self._forget_window(k, event))
-
-        header = tk.Frame(window, bg=PANEL, height=42)
-        header.pack(fill="x")
-        header.pack_propagate(False)
-        tk.Label(
-            header, text=f"  {title}", bg=PANEL, fg=TEXT,
-            font=("Arial", 12, "bold"),
-        ).pack(side="left", padx=8)
-        self._styled_button(
-            header, "×", close_window, bg=PANEL, fg=MUTED,
-            hover_bg="#4a3042", hover_fg="white",
-            font=("Arial", 16), width=3, pady=0,
-        ).pack(side="right", fill="y")
-
-        drag = {"x": 0, "y": 0}
-
-        def start_drag(event: tk.Event) -> None:
-            drag["x"], drag["y"] = event.x_root - window.winfo_x(), event.y_root - window.winfo_y()
-
-        def move_drag(event: tk.Event) -> None:
-            window.geometry(f"+{event.x_root - drag['x']}+{event.y_root - drag['y']}")
-
-        header.bind("<ButtonPress-1>", start_drag)
-        header.bind("<B1-Motion>", move_drag)
-        body = tk.Frame(window, bg=BG)
-        body.pack(fill="both", expand=True)
+        window.destroyed.connect(
+            lambda _object=None, app_key=key, item=window: self._forget_window(
+                app_key, item
+            )
+        )
+        window.show()
         return body
 
-    def _forget_window(self, key: str, event: tk.Event) -> None:
-        if event.widget is self.open_windows.get(key):
+    def _forget_window(self, key: str, window: InternalWindow) -> None:
+        if self.open_windows.get(key) is window:
             self.open_windows.pop(key, None)
-            self.window_close_handlers.pop(key, None)
 
     @staticmethod
-    def _label(parent: tk.Misc, text: str, **kwargs: object) -> tk.Label:
-        kwargs.setdefault("bg", BG)
-        kwargs.setdefault("fg", TEXT)
-        return tk.Label(parent, text=text, **kwargs)
+    def _layout(widget: QWidget, *, margins: int = 16) -> QVBoxLayout:
+        layout = QVBoxLayout(widget)
+        layout.setContentsMargins(margins, margins, margins, margins)
+        layout.setSpacing(10)
+        return layout
 
     @staticmethod
-    def _styled_button(
-        parent: tk.Misc,
-        text: str,
-        command: Callable[[], None],
-        *,
-        bg: str,
-        fg: str,
-        hover_bg: str,
-        hover_fg: str | None = None,
-        font: tuple[str, int] | tuple[str, int, str] | None = None,
-        width: int | None = None,
-        anchor: str = "center",
-        padx: int = 12,
-        pady: int = 8,
-    ) -> tk.Label:
-        button = tk.Label(
-            parent,
-            text=text,
-            bg=bg,
-            fg=fg,
-            font=font,
-            width=width,
-            anchor=anchor,
-            padx=padx,
-            pady=pady,
-            cursor="hand2",
-            takefocus=True,
-        )
-        button.bind("<Enter>", lambda _event: button.configure(
-            bg=hover_bg, fg=hover_fg or fg
-        ))
-        button.bind("<Leave>", lambda _event: button.configure(bg=bg, fg=fg))
-        button.bind("<Button-1>", lambda _event: command())
-        button.bind("<Return>", lambda _event: command())
-        button.bind("<space>", lambda _event: command())
+    def _label(text: str, *, muted: bool = False, size: int | None = None) -> QLabel:
+        label = QLabel(text)
+        if muted:
+            label.setStyleSheet(f"color: {MUTED};")
+        if size is not None:
+            label.setStyleSheet(f"font-size: {size}pt; font-weight: bold;")
+        return label
+
+    @staticmethod
+    def _button(text: str, callback: Callable[[], None]) -> QPushButton:
+        button = QPushButton(text)
+        button.clicked.connect(callback)
         return button
 
-    def _button(
-        self, parent: tk.Misc, text: str, command: Callable[[], None]
-    ) -> tk.Label:
-        return self._styled_button(
-            parent, text, command, bg=PANEL_LIGHT, fg=TEXT,
-            hover_bg="#343d54",
-        )
-
-    def open_welcome(self) -> None:
-        body = self._window("welcome", "Welcome to ArtifacialOS", "560x400")
+    def toggle_launcher(self) -> None:
+        existing = self.open_windows.get("launcher")
+        if existing is not None:
+            existing.close()
+            return
+        body = self._window("launcher", "Your apps", QSize(300, 410))
         if body is None:
             return
-        self._label(body, "Welcome home.", font=("Arial", 24, "bold")).pack(
-            anchor="w", padx=28, pady=(28, 8)
+        layout = self._layout(body, margins=14)
+        layout.addWidget(self._label("Your apps", size=16))
+        for label, callback in (
+            ("◎   Browser", self.open_browser),
+            ("▣   Files", self.open_files),
+            ("▤   Notes", self.open_notes),
+            ("＋   Calculator", self.open_calculator),
+            (">_   Terminal", self.open_terminal),
+            ("⚙   Settings", self.open_settings),
+            ("?   Welcome", self.open_welcome),
+        ):
+            layout.addWidget(self._button(label, callback))
+        layout.addStretch(1)
+
+    def open_welcome(self) -> None:
+        body = self._window("welcome", "Welcome to ArtifacialOS", QSize(560, 400))
+        if body is None:
+            return
+        layout = self._layout(body, margins=24)
+        layout.addWidget(self._label("Welcome home.", size=24))
+        layout.addWidget(
+            self._label(
+                "This is a desktop simulator built with Python and Qt.\n"
+                "It can't replace the operating system installed on your computer, "
+                "but\nyou can open apps, save notes, browse sample files, and try "
+                "the shell.",
+                muted=True,
+            )
         )
-        self._label(
-            body,
-            "This is a desktop simulator built using only Python's standard library.\n"
-            "It can't replace the operating system installed on your computer, but\n"
-            "you can open apps, save notes, browse sample files, and try the shell.",
-            fg=MUTED, justify="left",
-        ).pack(anchor="w", padx=28, pady=(0, 22))
         for text, action in (
             ("Open Files", self.open_files),
             ("Write a note", self.open_notes),
             ("Try the Terminal", self.open_terminal),
         ):
-            self._button(body, text, action).pack(anchor="w", padx=28, pady=5)
-
-    def open_files(self) -> None:
-        body = self._window("files", "Files", "700x460")
-        if body is None:
-            return
-        sidebar = tk.Frame(body, bg=PANEL, width=155)
-        sidebar.pack(side="left", fill="y")
-        sidebar.pack_propagate(False)
-        for name in ("Home", "Documents", "Desktop", "About this computer"):
-            self._button(sidebar, name, lambda item=name: self._show_file_location(item, listing)).pack(
-                fill="x", padx=8, pady=(10, 0)
-            )
-
-        content = tk.Frame(body, bg=BG)
-        content.pack(side="left", fill="both", expand=True, padx=18, pady=18)
-        heading = self._label(content, "Home", font=("Arial", 18, "bold"))
-        heading.pack(anchor="w", pady=(0, 12))
-        listing = tk.Listbox(
-            content, bg=PANEL, fg=TEXT, selectbackground=ACCENT,
-            selectforeground="#ffffff", relief="flat", borderwidth=0,
-            font=("Arial", 13),
-            activestyle="none",
-        )
-        listing.pack(fill="both", expand=True)
-        listing.bind("<Double-Button-1>", lambda _event: self._open_selected_file(listing))
-        self._show_file_location("Home", listing, heading)
-        self._button(content, "Open selected file", lambda: self._open_selected_file(listing)).pack(
-            anchor="e", pady=(12, 0)
-        )
+            layout.addWidget(self._button(text, action))
+        layout.addStretch(1)
 
     def open_browser(self) -> None:
-        body = self._window("browser", "Browser", "900x620")
+        body = self._window("browser", "Browser", QSize(1000, 650))
         if body is None:
             return
+        layout = QVBoxLayout(body)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(BrowserWidget())
 
-        results: queue.Queue[tuple[BrowserTab, int, str, object]] = queue.Queue()
-        ssl_context = _create_browser_ssl_context()
-        tabs: list[BrowserTab] = []
-        active_tab: BrowserTab | None = None
-
-        tab_bar = tk.Frame(body, bg=PANEL)
-        tab_bar.pack(fill="x", padx=12, pady=(12, 0))
-        add_tab_button = self._button(tab_bar, "+", lambda: create_tab())
-        add_tab_button.pack(side="right", padx=4, pady=4)
-        content = tk.Frame(body, bg=BG)
-        content.pack(fill="both", expand=True, padx=12, pady=8)
-
-        def update_history_buttons(tab: BrowserTab) -> None:
-            tab.back_button.configure(fg=TEXT if tab.history_index > 0 else MUTED)
-            tab.forward_button.configure(
-                fg=TEXT if tab.history_index + 1 < len(tab.history) else MUTED
-            )
-
-        def open_in_system_browser(tab: BrowserTab, url: str) -> None:
-            try:
-                opened = _open_in_system_browser(url)
-            except OSError as error:
-                tab.status.configure(
-                    text=f"Could not open system browser: {error}", fg="#ff8585"
+    def open_files(self) -> None:
+        body = self._window("files", "Files", QSize(700, 460))
+        if body is None:
+            return
+        layout = QHBoxLayout(body)
+        layout.setContentsMargins(0, 0, 0, 0)
+        sidebar = QWidget()
+        sidebar.setFixedWidth(170)
+        sidebar_layout = QVBoxLayout(sidebar)
+        sidebar_layout.setContentsMargins(10, 12, 10, 12)
+        listing = QListWidget()
+        content = QWidget()
+        content_layout = QVBoxLayout(content)
+        heading = self._label("Home", size=18)
+        content_layout.addWidget(heading)
+        content_layout.addWidget(listing, 1)
+        open_button = self._button(
+            "Open selected file",
+            lambda: self._open_selected_file(listing),
+        )
+        content_layout.addWidget(open_button, alignment=Qt.AlignmentFlag.AlignRight)
+        for location in ("Home", "Documents", "Desktop", "About this computer"):
+            sidebar_layout.addWidget(
+                self._button(
+                    location,
+                    lambda item=location: self._show_file_location(
+                        item, listing, heading
+                    ),
                 )
-                return
-            tab.status.configure(
-                text=(
-                    "Opened in your default browser"
-                    if opened else "Could not open system browser"
-                ),
-                fg=GREEN if opened else "#ff8585",
             )
-
-        def select_tab(tab: BrowserTab) -> None:
-            nonlocal active_tab
-            if active_tab is tab:
-                return
-            if active_tab is not None and active_tab in tabs:
-                active_tab.frame.pack_forget()
-                active_tab.tab_button.configure(bg=PANEL, fg=MUTED)
-            active_tab = tab
-            tab.frame.pack(fill="both", expand=True)
-            tab.tab_button.configure(bg=PANEL_LIGHT, fg=TEXT)
-            update_history_buttons(tab)
-
-        def fetch_page(
-            tab: BrowserTab, url: str, current_request: int, mode: str
-        ) -> None:
-            try:
-                request = Request(
-                    url,
-                    headers={
-                        "User-Agent": (
-                            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                            "AppleWebKit/537.36 (KHTML, like Gecko) "
-                            "Chrome/131.0.0.0 Safari/537.36"
-                        ),
-                        "Accept": "text/html,application/xhtml+xml",
-                    },
-                )
-                with urlopen(request, timeout=12, context=ssl_context) as response:
-                    content_type = response.headers.get_content_type()
-                    charset = response.headers.get_content_charset() or "utf-8"
-                    content = response.read(2_000_001)
-                    if len(content) > 2_000_000:
-                        raise ValueError("This page is too large to display (over 2 MB).")
-                    document = content.decode(charset, errors="replace")
-                    final_url = response.geturl()
-                if content_type in ("text/html", "application/xhtml+xml"):
-                    parser = PageTextParser()
-                    parser.feed(document)
-                    title, text, links = parser.result()
-                    if not text:
-                        text = "This page contains no readable text."
-                elif content_type.startswith("text/") or content_type == "application/json":
-                    title = final_url
-                    text = document
-                    links = []
-                else:
-                    raise ValueError(f"This browser cannot display {content_type} files.")
-                results.put(
-                    (tab, current_request, "page", (mode, final_url, title, text, links))
-                )
-            except (
-                OSError, URLError, TimeoutError, UnicodeError, ValueError,
-                LookupError, http.client.HTTPException,
-            ) as error:
-                results.put((tab, current_request, "error", str(error)))
-
-        def navigate(tab: BrowserTab, value: str, mode: str = "new") -> None:
-            try:
-                url = _normalize_browser_address(value)
-            except ValueError as error:
-                tab.status.configure(text=str(error), fg="#ff8585")
-                return
-            tab.request_id += 1
-            current_request = tab.request_id
-            tab.address.delete(0, "end")
-            tab.address.insert(0, url)
-            tab.status.configure(text="Loading…", fg=MUTED)
-            tab.external_button.pack_forget()
-            threading.Thread(
-                target=fetch_page,
-                args=(tab, url, current_request, mode),
-                daemon=True,
-            ).start()
-
-        def render_page(
-            tab: BrowserTab, url: str, title: str, text: str,
-            links: list[tuple[str, str]],
-        ) -> None:
-            tab.page.configure(state="normal")
-            tab.page.delete("1.0", "end")
-            tab.page.insert("end", title or url, "page_title")
-            tab.page.insert("end", "\n\n")
-            tab.page.insert("end", text)
-            search_from = "3.0"
-            for index, (label, href) in enumerate(links):
-                if not label.strip():
-                    continue
-                start = tab.page.search(label, search_from, stopindex="end")
-                if not start:
-                    continue
-                end = f"{start}+{len(label)}c"
-                tag = f"link_{index}"
-                tab.page.tag_add(tag, start, end)
-                tab.page.tag_configure(tag, foreground="#3459bd", underline=True)
-                tab.page.tag_bind(
-                    tag, "<Button-1>",
-                    lambda _event, target=urljoin(url, href), current_tab=tab:
-                        navigate(current_tab, target),
-                )
-                tab.page.tag_bind(
-                    tag, "<Enter>",
-                    lambda _event, current_page=tab.page:
-                        current_page.configure(cursor="hand2"),
-                )
-                tab.page.tag_bind(
-                    tag, "<Leave>",
-                    lambda _event, current_page=tab.page:
-                        current_page.configure(cursor="arrow"),
-                )
-                search_from = end
-            tab.page.yview_moveto(0)
-            tab.page_title.configure(text=title or url, fg=TEXT)
-            tab.tab_button.configure(text=(title or "New Tab")[:24])
-            if (
-                urlsplit(url).hostname in ("www.startpage.com", "startpage.com")
-                and (
-                    title.lower().startswith("access denied")
-                    or "could not load its javascript" in text.lower()
-                    or "verifying your request" in text.lower()
-                )
-            ):
-                tab.page.insert(
-                    "end",
-                    "\n\nStartpage blocked this text-only browser. "
-                    "Open the page in your system browser to continue.",
-                )
-                tab.external_button.pack(side="right", padx=8)
-
-        def poll_results() -> None:
-            if not body.winfo_exists():
-                return
-            while True:
-                try:
-                    tab, result_id, result_type, data = results.get_nowait()
-                except queue.Empty:
-                    break
-                if tab not in tabs or result_id != tab.request_id:
-                    continue
-                if result_type == "error":
-                    tab.status.configure(text=f"Could not load page: {data}", fg="#ff8585")
-                    if urlsplit(tab.address.get()).hostname == "www.startpage.com":
-                        tab.external_button.pack(side="right", padx=8)
-                    continue
-                mode, url, title, text, links = data
-                if mode == "new":
-                    del tab.history[tab.history_index + 1:]
-                    tab.history.append(url)
-                    tab.history_index = len(tab.history) - 1
-                elif mode == "back":
-                    tab.history_index = max(0, tab.history_index - 1)
-                elif mode == "forward":
-                    tab.history_index = min(len(tab.history) - 1, tab.history_index + 1)
-                tab.address.delete(0, "end")
-                tab.address.insert(0, url)
-                render_page(tab, url, title, text, links)
-                tab.status.configure(text=url, fg=MUTED)
-                update_history_buttons(tab)
-            body.after(100, poll_results)
-
-        def create_tab(url: str = STARTPAGE_URL) -> None:
-            tab_frame = tk.Frame(content, bg=BG)
-            tab_header = tk.Frame(tab_bar, bg=PANEL)
-            tab_header.pack(side="left", padx=3, pady=4)
-            tab_button = self._styled_button(
-                tab_header, "New Tab", lambda: None, bg=PANEL, fg=MUTED,
-                hover_bg=PANEL_LIGHT, padx=10, pady=6,
-            )
-            tab_button.pack(side="left")
-            close_button = self._styled_button(
-                tab_header, "×", lambda: None, bg=PANEL, fg=MUTED,
-                hover_bg="#4a3042", width=2, padx=4, pady=6,
-            )
-            close_button.pack(side="left")
-
-            toolbar = tk.Frame(tab_frame, bg=PANEL)
-            toolbar.pack(fill="x", pady=(0, 8))
-            navigation = tk.Frame(toolbar, bg=PANEL)
-            navigation.pack(fill="x", padx=8, pady=8)
-            back_button = self._styled_button(
-                navigation, "←", lambda: None, bg=PANEL, fg=MUTED,
-                hover_bg=PANEL_LIGHT, font=("Arial", 16, "bold"), width=3,
-            )
-            back_button.pack(side="left", padx=(4, 0))
-            forward_button = self._styled_button(
-                navigation, "→", lambda: None, bg=PANEL, fg=MUTED,
-                hover_bg=PANEL_LIGHT, font=("Arial", 16, "bold"), width=3,
-            )
-            forward_button.pack(side="left")
-            refresh_button = self._styled_button(
-                navigation, "↻", lambda: None, bg=PANEL, fg=TEXT,
-                hover_bg=PANEL_LIGHT, font=("Arial", 16), width=3,
-            )
-            refresh_button.pack(side="left")
-            go_button = self._button(navigation, "Go", lambda: None)
-            go_button.pack(side="right", padx=(4, 8))
-            address = tk.Entry(
-                navigation, bg="#10131c", fg=TEXT, insertbackground=TEXT,
-                relief="flat", font=("Arial", 12),
-            )
-            address.pack(side="left", fill="x", expand=True, padx=8, ipady=9)
-
-            controls = tk.Frame(toolbar, bg=PANEL)
-            controls.pack(fill="x", padx=8, pady=(0, 8))
-            page_title = self._label(controls, "Startpage", fg=MUTED)
-            page_title.pack(side="left", padx=8)
-            status = self._label(controls, "Loading Startpage…", fg=MUTED)
-            status.pack(side="right", padx=8)
-            external_button = self._button(
-                controls, "Open in system browser",
-                lambda: open_in_system_browser(tab, address.get()),
-            )
-
-            reader_frame = tk.Frame(tab_frame, bg=BG)
-            reader_frame.pack(fill="both", expand=True)
-            scrollbar = tk.Scrollbar(reader_frame)
-            scrollbar.pack(side="right", fill="y")
-            page = tk.Text(
-                reader_frame, bg="#faf9f6", fg="#20212a",
-                insertbackground="#20212a", relief="flat", wrap="word",
-                padx=30, pady=24, font=("Arial", 14),
-                yscrollcommand=scrollbar.set, cursor="arrow",
-            )
-            page.pack(side="left", fill="both", expand=True)
-            scrollbar.configure(command=page.yview)
-            page.tag_configure("page_title", font=("Arial", 24, "bold"), spacing3=18)
-            page.insert("1.0", "Loading Startpage…", "page_title")
-            page.bind("<Key>", lambda _event: "break")
-
-            tab = BrowserTab(
-                frame=tab_frame,
-                address=address,
-                page=page,
-                page_title=page_title,
-                status=status,
-                tab_button=tab_button,
-                external_button=external_button,
-                back_button=back_button,
-                forward_button=forward_button,
-            )
-            tabs.append(tab)
-            tab_button.bind("<Button-1>", lambda _event: select_tab(tab))
-            close_button.bind("<Button-1>", lambda _event: close_tab(tab))
-            back_button.bind(
-                "<Button-1>",
-                lambda _event: navigate(tab, tab.history[tab.history_index - 1], "back")
-                if tab.history_index > 0 else None,
-            )
-            forward_button.bind(
-                "<Button-1>",
-                lambda _event: navigate(tab, tab.history[tab.history_index + 1], "forward")
-                if tab.history_index + 1 < len(tab.history) else None,
-            )
-            refresh_button.bind(
-                "<Button-1>",
-                lambda _event: navigate(tab, tab.history[tab.history_index], "refresh")
-                if tab.history_index >= 0 else navigate(tab, tab.address.get()),
-            )
-            go_button.bind("<Button-1>", lambda _event: navigate(tab, address.get()))
-            address.bind("<Return>", lambda _event: navigate(tab, address.get()))
-            select_tab(tab)
-            navigate(tab, url)
-
-        def close_tab(tab: BrowserTab) -> None:
-            if tab not in tabs:
-                return
-            index = tabs.index(tab)
-            tab.request_id += 1
-            tabs.remove(tab)
-            tab.frame.destroy()
-            tab.tab_button.master.destroy()
-            if active_tab is tab:
-                if tabs:
-                    select_tab(tabs[min(index, len(tabs) - 1)])
-                else:
-                    create_tab()
-
-        create_tab()
-        poll_results()
+        sidebar_layout.addStretch(1)
+        layout.addWidget(sidebar)
+        layout.addWidget(content, 1)
+        listing.itemDoubleClicked.connect(lambda _item: self._open_selected_file(listing))
+        self._show_file_location("Home", listing, heading)
 
     def _show_file_location(
-        self, location: str, listing: tk.Listbox, heading: tk.Label | None = None
+        self, location: str, listing: QListWidget, heading: QLabel
     ) -> None:
-        if heading is not None:
-            heading.configure(text=location)
-        listing.delete(0, "end")
+        heading.setText(location)
+        listing.clear()
         if location == "About this computer":
-            listing.insert("end", f"ArtifacialOS 1.0  ·  Python {platform.python_version()}")
-            listing.insert("end", f"Host: {platform.system()} {platform.release()}")
+            listing.addItems(
+                [
+                    f"ArtifacialOS 1.0  ·  Python {platform.python_version()}",
+                    f"Host: {platform.system()} {platform.release()}",
+                ]
+            )
             return
-        files = self.filesystem if location in ("Home", "Documents") else {
-            "Readme.txt": "Your desktop is looking good."
-        }
-        for name in files:
-            listing.insert("end", f"▤   {name}")
+        files = (
+            self.filesystem
+            if location in ("Home", "Documents")
+            else {"Readme.txt": "Your desktop is looking good."}
+        )
+        listing.addItems(f"▤   {name}" for name in files)
 
-    def _open_selected_file(self, listing: tk.Listbox) -> None:
-        selected = listing.curselection()
-        if not selected:
+    def _open_selected_file(self, listing: QListWidget) -> None:
+        selected = listing.currentItem()
+        if selected is None:
             return
-        entry = listing.get(selected[0])
-        filename = entry.split("   ", 1)[-1]
+        filename = selected.text().split("   ", 1)[-1]
         content = self.filesystem.get(filename)
         if content is None:
             return
-        body = self._window(f"file:{filename}", filename, "560x400")
+        body = self._window(f"file:{filename}", filename, QSize(560, 400))
         if body is None:
             return
-        text = tk.Text(
-            body, bg=PANEL, fg=TEXT, insertbackground=TEXT, relief="flat",
-            wrap="word", padx=14, pady=14,
-        )
-        text.pack(fill="both", expand=True, padx=16, pady=16)
-        text.insert("1.0", content)
-        text.configure(state="disabled")
+        layout = self._layout(body)
+        text = QPlainTextEdit()
+        text.setPlainText(content)
+        text.setReadOnly(True)
+        layout.addWidget(text)
 
     def open_notes(self) -> None:
-        body = self._window("notes", "Notes", "820x560")
+        body = self._window("notes", "Notes", QSize(820, 560))
         if body is None:
             return
-
         notes: list[dict[str, str]] = []
         current_id: str | None = None
-        save_job: str | None = None
         loading = False
 
         try:
@@ -797,105 +531,105 @@ class ArtifacialOS:
                             and isinstance(item.get("title"), str)
                             and isinstance(item.get("body"), str)
                         ):
-                            notes.append({
-                                "id": item["id"],
-                                "title": item["title"],
-                                "body": item["body"],
-                                "updated": str(item.get("updated", "")),
-                            })
+                            notes.append(
+                                {
+                                    "id": item["id"],
+                                    "title": item["title"],
+                                    "body": item["body"],
+                                    "updated": str(item.get("updated", "")),
+                                }
+                            )
                 elif stored:
-                    notes.append({
-                        "id": uuid4().hex,
-                        "title": "My first note",
-                        "body": stored,
-                        "updated": datetime.now().isoformat(timespec="seconds"),
-                    })
+                    notes.append(
+                        {
+                            "id": uuid4().hex,
+                            "title": "My first note",
+                            "body": stored,
+                            "updated": datetime.now().isoformat(timespec="seconds"),
+                        }
+                    )
         except (OSError, json.JSONDecodeError, ValueError) as error:
-            messagebox.showerror("Could not load notes", str(error), parent=self.root)
+            QMessageBox.critical(body, "Could not load notes", str(error))
 
-        toolbar = tk.Frame(body, bg=BG)
-        toolbar.pack(fill="x", padx=16, pady=(14, 10))
-        self._label(toolbar, "My notes", font=("Arial", 21, "bold")).pack(side="left")
-        self._button(toolbar, "＋  New note", lambda: create_note()).pack(side="right")
+        root = self._layout(body, margins=14)
+        top = QHBoxLayout()
+        top.addWidget(self._label("My notes", size=21))
+        top.addStretch(1)
+        new_button = self._button("＋  New note", lambda: create_note())
+        top.addWidget(new_button)
+        root.addLayout(top)
+        split = QSplitter()
+        sidebar = QWidget()
+        sidebar.setMinimumWidth(210)
+        side_layout = QVBoxLayout(sidebar)
+        search = QLineEdit()
+        search.setPlaceholderText("Search notes...")
+        side_layout.addWidget(search)
+        note_list = QListWidget()
+        side_layout.addWidget(note_list, 1)
+        split.addWidget(sidebar)
+        editor_area = QWidget()
+        editor_layout = QVBoxLayout(editor_area)
+        title = QLineEdit()
+        title.setPlaceholderText("Untitled note")
+        title.setStyleSheet("font-size: 20pt; font-weight: bold;")
+        editor = QTextEdit()
+        editor.setPlaceholderText("Start writing...")
+        editor_layout.addWidget(title)
+        editor_layout.addWidget(editor, 1)
+        split.addWidget(editor_area)
+        split.setStretchFactor(1, 1)
+        root.addWidget(split, 1)
+        footer = QHBoxLayout()
+        status = self._label("", muted=True)
+        footer.addWidget(status)
+        footer.addStretch(1)
+        delete_button = self._button("Delete note", lambda: delete_note())
+        save_button = self._button("Save now", lambda: save_note())
+        footer.addWidget(delete_button)
+        footer.addWidget(save_button)
+        root.addLayout(footer)
 
-        footer = tk.Frame(body, bg=BG)
-        footer.pack(fill="x", padx=16, pady=(0, 12))
-        status = self._label(footer, "", fg=MUTED)
-        status.pack(side="left")
-        delete_button = self._button(footer, "Delete note", lambda: delete_note())
-        delete_button.pack(side="right", padx=(8, 0))
-        self._button(footer, "Save now", lambda: save_note()).pack(side="right")
-
-        workspace = tk.Frame(body, bg=BG)
-        workspace.pack(fill="both", expand=True, padx=16, pady=(0, 10))
-        sidebar = tk.Frame(workspace, bg=PANEL, width=235)
-        sidebar.pack(side="left", fill="y", padx=(0, 14))
-        sidebar.pack_propagate(False)
-
-        search = tk.Entry(
-            sidebar, bg="#111520", fg=TEXT, insertbackground=TEXT,
-            relief="flat", font=("Arial", 12),
-        )
-        search.pack(fill="x", padx=10, pady=10, ipady=8)
-        search.insert(0, "Search notes...")
-
-        note_list = tk.Listbox(
-            sidebar, bg=PANEL, fg=TEXT, selectbackground=ACCENT,
-            selectforeground="#ffffff", relief="flat", borderwidth=0,
-            font=("Arial", 12), activestyle="none", exportselection=False,
-        )
-        note_list.pack(fill="both", expand=True, padx=6, pady=(0, 8))
-
-        editor_area = tk.Frame(workspace, bg=BG)
-        editor_area.pack(side="left", fill="both", expand=True)
-        title = tk.Entry(
-            editor_area, bg=BG, fg=TEXT, insertbackground=TEXT,
-            relief="flat", font=("Arial", 20, "bold"),
-        )
-        title.pack(fill="x", pady=(4, 12), ipady=5)
-        editor = tk.Text(
-            editor_area, bg=PANEL, fg=TEXT, insertbackground=TEXT,
-            relief="flat", wrap="word", padx=16, pady=14, undo=True,
-            font=("Arial", 13), spacing1=2, spacing3=4,
-        )
-        editor.pack(fill="both", expand=True)
+        save_timer = QTimer(body)
+        save_timer.setSingleShot(True)
+        save_timer.setInterval(700)
 
         def refresh_list() -> None:
-            note_list.delete(0, "end")
-            query = search.get().strip().lower()
-            if query == "search notes...":
-                query = ""
-            for note in sorted(notes, key=lambda item: item["updated"], reverse=True):
-                if query and query not in note["title"].lower() and query not in note["body"].lower():
-                    continue
-                note_list.insert("end", note["title"] or "Untitled note")
+            query = search.text().strip().lower()
+            ordered = sorted(notes, key=lambda item: item["updated"], reverse=True)
+            visible = [
+                note
+                for note in ordered
+                if not query
+                or query in note["title"].lower()
+                or query in note["body"].lower()
+            ]
+            note_list.clear()
+            for note in visible:
+                from PySide6.QtWidgets import QListWidgetItem
+
+                item = QListWidgetItem(note["title"] or "Untitled note")
+                item.setData(Qt.ItemDataRole.UserRole, note["id"])
+                note_list.addItem(item)
                 if note["id"] == current_id:
-                    note_list.selection_set("end")
-                    note_list.activate("end")
+                    note_list.setCurrentItem(item)
 
         def update_status(message: str = "All changes saved") -> None:
-            words = len(editor.get("1.0", "end-1c").split()) if current_id else 0
-            word_label = f"{words} word" if words == 1 else f"{words} words"
-            status.configure(
-                text=f"{message}  ·  {word_label}",
-                fg=GREEN if message.startswith("Saved") else MUTED,
+            words = len(editor.toPlainText().split()) if current_id else 0
+            word_label = "word" if words == 1 else "words"
+            status.setText(f"{message}  ·  {words} {word_label}")
+            status.setStyleSheet(
+                f"color: {GREEN if message.startswith('Saved') else MUTED};"
             )
 
         def load_note(note: dict[str, str] | None) -> None:
             nonlocal current_id, loading
             current_id = note["id"] if note else None
             loading = True
-            title.delete(0, "end")
-            editor.delete("1.0", "end")
-            if note:
-                title.insert(0, note["title"])
-                editor.insert("1.0", note["body"])
-                title.configure(state="normal")
-                editor.configure(state="normal")
-                editor.focus_set()
-            else:
-                title.configure(state="disabled")
-                editor.configure(state="disabled")
+            title.setText(note["title"] if note else "")
+            editor.setPlainText(note["body"] if note else "")
+            title.setEnabled(note is not None)
+            editor.setEnabled(note is not None)
             loading = False
             refresh_list()
             update_status("Ready" if note else "Create a note to get started")
@@ -905,26 +639,27 @@ class ArtifacialOS:
                 self.notes_path.parent.mkdir(parents=True, exist_ok=True)
                 temporary_path = self.notes_path.with_suffix(".tmp")
                 temporary_path.write_text(
-                    json.dumps({"version": 1, "notes": notes}, ensure_ascii=False, indent=2),
+                    json.dumps(
+                        {"version": 1, "notes": notes},
+                        ensure_ascii=False,
+                        indent=2,
+                    ),
                     encoding="utf-8",
                 )
                 temporary_path.replace(self.notes_path)
             except OSError as error:
-                messagebox.showerror("Could not save notes", str(error), parent=body)
+                QMessageBox.critical(body, "Could not save notes", str(error))
                 update_status("Save failed")
                 return False
             return True
 
         def save_note() -> bool:
-            nonlocal save_job
-            if save_job is not None:
-                body.after_cancel(save_job)
-                save_job = None
+            save_timer.stop()
             note = next((item for item in notes if item["id"] == current_id), None)
             if note is None:
                 return True
-            note["title"] = title.get().strip() or "Untitled note"
-            note["body"] = editor.get("1.0", "end-1c")
+            note["title"] = title.text().strip() or "Untitled note"
+            note["body"] = editor.toPlainText()
             note["updated"] = datetime.now().isoformat(timespec="seconds")
             if not persist_notes():
                 return False
@@ -932,14 +667,11 @@ class ArtifacialOS:
             update_status(f"Saved at {datetime.now().strftime('%I:%M %p')}")
             return True
 
-        def schedule_save(_event: tk.Event | None = None) -> None:
-            nonlocal save_job
+        def schedule_save() -> None:
             if loading or current_id is None:
                 return
-            if save_job is not None:
-                body.after_cancel(save_job)
             update_status("Unsaved changes")
-            save_job = body.after(700, save_note)
+            save_timer.start()
 
         def create_note() -> None:
             if not save_note():
@@ -952,7 +684,7 @@ class ArtifacialOS:
             }
             notes.append(note)
             load_note(note)
-            title.select_range(0, "end")
+            title.selectAll()
             schedule_save()
 
         def delete_note() -> None:
@@ -961,13 +693,14 @@ class ArtifacialOS:
             note = next((item for item in notes if item["id"] == current_id), None)
             if note is None:
                 return
-            if not messagebox.askyesno(
+            answer = QMessageBox.question(
+                body,
                 "Delete note",
                 f"Delete “{note['title'] or 'Untitled note'}”?",
-                parent=body,
-            ):
-                return
-            if not save_note():
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes or not save_note():
                 return
             notes.remove(note)
             if not persist_notes():
@@ -976,89 +709,63 @@ class ArtifacialOS:
                 return
             load_note(notes[0] if notes else None)
 
-        def select_note(_event: tk.Event | None = None) -> None:
-            selection = note_list.curselection()
-            if not selection:
+        def select_note() -> None:
+            selected = note_list.currentItem()
+            if selected is None:
                 return
-            visible = [
-                note for note in sorted(notes, key=lambda item: item["updated"], reverse=True)
-                if not search.get().strip()
-                or search.get().strip().lower() in note["title"].lower()
-                or search.get().strip().lower() in note["body"].lower()
-            ]
-            if search.get().strip().lower() == "search notes...":
-                visible = sorted(notes, key=lambda item: item["updated"], reverse=True)
-            if selection[0] >= len(visible):
-                return
-            selected = visible[selection[0]]
-            if selected["id"] == current_id:
-                return
-            if save_note():
-                load_note(selected)
+            selected_id = selected.data(Qt.ItemDataRole.UserRole)
+            note = next((item for item in notes if item["id"] == selected_id), None)
+            if note is not None and note["id"] != current_id and save_note():
+                load_note(note)
 
-        def close_notes() -> None:
-            if save_note():
-                body.winfo_toplevel().destroy()
-
-        def clear_search(_event: tk.Event) -> None:
-            if search.get() == "Search notes...":
-                search.delete(0, "end")
-
-        search.bind("<FocusIn>", clear_search)
-        search.bind("<KeyRelease>", lambda _event: refresh_list())
-        search.bind("<Return>", select_note)
-        note_list.bind("<<ListboxSelect>>", select_note)
-        title.bind("<KeyRelease>", schedule_save)
-        title.bind("<FocusOut>", schedule_save)
-        editor.bind("<KeyRelease>", schedule_save)
-        editor.bind("<Control-s>", lambda _event: (save_note(), "break")[1])
-        editor.bind("<Command-s>", lambda _event: (save_note(), "break")[1])
-        title.bind("<Control-s>", lambda _event: (save_note(), "break")[1])
-        title.bind("<Command-s>", lambda _event: (save_note(), "break")[1])
-        body.bind("<Control-n>", lambda _event: (create_note(), "break")[1])
-        body.bind("<Command-n>", lambda _event: (create_note(), "break")[1])
-
-        self.window_close_handlers["notes"] = close_notes
+        search.textChanged.connect(refresh_list)
+        note_list.itemSelectionChanged.connect(select_note)
+        title.textChanged.connect(schedule_save)
+        editor.textChanged.connect(schedule_save)
+        save_timer.timeout.connect(save_note)
+        delete_button.clicked.connect(delete_note)
+        save_button.clicked.connect(save_note)
+        subwindow = self.open_windows["notes"]
+        subwindow.before_close = save_note
         refresh_list()
         load_note(notes[0] if notes else None)
 
     def open_calculator(self) -> None:
-        body = self._window("calculator", "Calculator", "360x430")
+        body = self._window("calculator", "Calculator", QSize(360, 430))
         if body is None:
             return
-        display = tk.Entry(
-            body, bg=PANEL, fg=TEXT, insertbackground=TEXT, relief="flat",
-            font=("Arial", 23), justify="right",
+        layout = self._layout(body, margins=14)
+        display = QLineEdit()
+        display.setAlignment(Qt.AlignmentFlag.AlignRight)
+        display.setStyleSheet("font-size: 23pt;")
+        layout.addWidget(display)
+        grid = QGridLayout()
+        grid.setSpacing(6)
+        keys = (
+            "C", "(", ")", "÷", "7", "8", "9", "×", "4", "5", "6", "−",
+            "1", "2", "3", "+", "⌫", "0", ".", "=",
         )
-        display.pack(fill="x", padx=18, pady=18, ipady=12)
-        buttons = tk.Frame(body, bg=BG)
-        buttons.pack(fill="both", expand=True, padx=14, pady=(0, 14))
-        keys = ("C", "(", ")", "÷", "7", "8", "9", "×", "4", "5", "6", "−",
-                "1", "2", "3", "+", "⌫", "0", ".", "=")
 
         def press(value: str) -> None:
             if value == "C":
-                display.delete(0, "end")
+                display.clear()
             elif value == "⌫":
-                display.delete(max(0, len(display.get()) - 1), "end")
+                display.setText(display.text()[:-1])
             elif value == "=":
                 try:
-                    result = self._calculate(display.get())
-                    display.delete(0, "end")
-                    display.insert(0, str(result))
+                    display.setText(str(self._calculate(display.text())))
                 except (ValueError, ZeroDivisionError, OverflowError) as error:
-                    messagebox.showerror("Calculation error", str(error), parent=body)
+                    QMessageBox.critical(body, "Calculation error", str(error))
             else:
-                display.insert("end", {"÷": "/", "×": "*", "−": "-"}.get(value, value))
+                display.setText(
+                    display.text() + {"÷": "/", "×": "*", "−": "-"}.get(value, value)
+                )
 
         for index, key in enumerate(keys):
-            button = self._button(buttons, key, lambda item=key: press(item))
-            button.grid(row=index // 4, column=index % 4, sticky="nsew", padx=4, pady=4)
-        for row in range(5):
-            buttons.rowconfigure(row, weight=1)
-        for column in range(4):
-            buttons.columnconfigure(column, weight=1)
-        display.bind("<Return>", lambda _event: press("="))
+            button = self._button(key, lambda item=key: press(item))
+            grid.addWidget(button, index // 4, index % 4)
+        layout.addLayout(grid, 1)
+        display.returnPressed.connect(lambda: press("="))
 
     @staticmethod
     def _calculate(expression: str) -> int | float:
@@ -1094,31 +801,27 @@ class ArtifacialOS:
             raise ValueError("That expression is not valid.") from error
 
     def open_terminal(self) -> None:
-        body = self._window("terminal", "Terminal", "720x470")
+        body = self._window("terminal", "Terminal", QSize(720, 470))
         if body is None:
             return
-        output = tk.Text(
-            body, bg="#0b0e14", fg="#f0f2f8", insertbackground=TEXT,
-            relief="flat", font=("Menlo", 13), wrap="word", padx=14, pady=14,
-            state="disabled",
+        layout = self._layout(body, margins=14)
+        output = QPlainTextEdit()
+        output.setReadOnly(True)
+        output.setStyleSheet(
+            "background: #0b0e14; color: #f0f2f8; font: 13pt Menlo;"
         )
-        output.pack(fill="both", expand=True, padx=14, pady=(14, 8))
-        command = tk.Entry(
-            body, bg=PANEL, fg=TEXT, insertbackground=TEXT, relief="flat",
-            font=("Menlo", 13),
-        )
-        command.pack(fill="x", padx=14, pady=(0, 14), ipady=9)
-        command.insert(0, "help")
+        command = QLineEdit()
+        command.setStyleSheet("font: 13pt Menlo;")
+        command.setText("help")
+        layout.addWidget(output, 1)
+        layout.addWidget(command)
 
         def write(text: str) -> None:
-            output.configure(state="normal")
-            output.insert("end", text + "\n")
-            output.see("end")
-            output.configure(state="disabled")
+            output.appendPlainText(text)
 
-        def run_command(_event: tk.Event | None = None) -> None:
-            raw = command.get().strip()
-            command.delete(0, "end")
+        def run_command() -> None:
+            raw = command.text().strip()
+            command.clear()
             if not raw:
                 return
             write(f"you@artifacial:~$ {raw}")
@@ -1144,80 +847,50 @@ class ArtifacialOS:
             elif name == "echo":
                 write(argument)
             elif name == "clear":
-                output.configure(state="normal")
-                output.delete("1.0", "end")
-                output.configure(state="disabled")
+                output.clear()
             else:
                 write(f"{name}: command not found (try 'help')")
 
-        command.bind("<Return>", run_command)
+        command.returnPressed.connect(run_command)
         run_command()
-        command.focus_set()
+        command.setFocus()
 
     def open_settings(self) -> None:
-        body = self._window("settings", "Settings", "520x400")
+        body = self._window("settings", "Settings", QSize(520, 400))
         if body is None:
             return
-        self._label(body, "System settings", font=("Arial", 20, "bold")).pack(
-            anchor="w", padx=24, pady=(24, 16)
+        layout = self._layout(body, margins=24)
+        layout.addWidget(self._label("System settings", size=20))
+        layout.addWidget(self._label("About this desktop", size=12))
+        layout.addWidget(
+            self._label(
+                f"ArtifacialOS 1.0\nPython {platform.python_version()} · "
+                f"{platform.system()}\nA friendly desktop simulator.",
+                muted=True,
+            )
         )
-        self._label(body, "About this desktop", font=("Arial", 12, "bold")).pack(
-            anchor="w", padx=24, pady=(4, 6)
+        layout.addWidget(self._label("Built-in apps", size=12))
+        layout.addWidget(
+            self._label(
+                "Browser  ·  Files  ·  Notes  ·  Calculator  ·  Terminal",
+                muted=True,
+            )
         )
-        self._label(
-            body,
-            f"ArtifacialOS 1.0\nPython {platform.python_version()} · {platform.system()}\n"
-            "A friendly desktop simulator. No extra packages required.",
-            fg=MUTED, justify="left",
-        ).pack(anchor="w", padx=24, pady=(0, 20))
-        self._label(body, "Built-in apps", font=("Arial", 12, "bold")).pack(
-            anchor="w", padx=24, pady=(4, 6)
-        )
-        self._label(
-            body, "Browser  ·  Files  ·  Notes  ·  Calculator  ·  Terminal",
-            fg=MUTED,
-        ).pack(anchor="w", padx=24)
-
-    def toggle_launcher(self) -> None:
-        if self.launcher is not None and self.launcher.winfo_exists():
-            self.launcher.destroy()
-            self.launcher = None
-            return
-        launcher = tk.Toplevel(self.root)
-        self.launcher = launcher
-        launcher.overrideredirect(True)
-        launcher.configure(bg=PANEL)
-        launcher.geometry(f"270x380+14+{max(80, self.root.winfo_height() - 455)}")
-        launcher.attributes("-topmost", True)
-        tk.Label(
-            launcher, text="Your apps", bg=PANEL, fg=TEXT,
-            font=("Arial", 15, "bold"),
-        ).pack(anchor="w", padx=18, pady=(16, 10))
-        for label, callback in (
-            ("◎   Browser", self.open_browser),
-            ("▣   Files", self.open_files),
-            ("▤   Notes", self.open_notes),
-            ("＋   Calculator", self.open_calculator),
-            (">_   Terminal", self.open_terminal),
-            ("⚙   Settings", self.open_settings),
-            ("?   Welcome", self.open_welcome),
-        ):
-            def launch(action: Callable[[], None] = callback) -> None:
-                launcher.destroy()
-                self.launcher = None
-                action()
-
-            self._styled_button(
-                launcher, label, launch, anchor="w", bg=PANEL, fg=TEXT,
-                hover_bg=PANEL_LIGHT, padx=18,
-            ).pack(fill="x", padx=6)
+        layout.addStretch(1)
 
 
 def main() -> None:
-    root = tk.Tk()
-    ArtifacialOS(root)
-    root.mainloop()
+    app = QApplication(sys.argv)
+    app.setApplicationName("ArtifacialOS")
+    window = ArtifacialOS()
+    window.show()
+    try:
+        exit_code = app.exec()
+    except KeyboardInterrupt:
+        exit_code = 0
+    raise SystemExit(exit_code)
 
 
 if __name__ == "__main__":
     main()
+
