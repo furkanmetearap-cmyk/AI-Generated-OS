@@ -1,4 +1,4 @@
-# AI-Generated-OS-v1.3
+# AI-Generated-OS
 
 So ArtificalOS is an operating system made entirely by AI with notes, calculator and even a fully working Browser!
 All using 1 python file and yes the browser has an incognito search engine!
